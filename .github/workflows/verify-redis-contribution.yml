@@ -1,0 +1,65 @@
+name: Verify Redis contribution
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  checkpoint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version:
+        - '3.10'
+        - '3.11'
+        - '3.12'
+        - '3.13'
+        - '3.14'
+    name: 'test #${{ matrix.python-version }}'
+    services:
+      redis:
+        image: redis:8.0.5-alpine
+        ports:
+        - 6379:6379
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout
+          3s --health-retries 5
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: 390249b76073ae93a6511ce7fdb5ac7d8b91c2c0
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: ./.github/actions/uv_setup
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache-suffix: test-libs/checkpoint
+        working-directory: libs/checkpoint
+    - name: Install dependencies
+      shell: bash
+      working-directory: libs/checkpoint
+      run: uv sync --frozen --group test --no-dev
+    - name: Check Redis is available
+      shell: bash
+      working-directory: libs/checkpoint
+      run: uv run python -c "import redis; assert redis.Redis(host='localhost', port=6379,
+        socket_connect_timeout=5, socket_timeout=5).ping()"
+    - name: Run tests
+      shell: bash
+      working-directory: libs/checkpoint
+      run: make test
+    - name: Ensure the tests did not create any additional files
+      shell: bash
+      working-directory: libs/checkpoint
+      run: 'set -eu
+
+
+        STATUS="$(git status)"
+
+        echo "$STATUS"
+
+
+        # grep will exit non-zero if the target message isn''t found,
+
+        # and `set -e` above will cause the step to fail.
+
+        echo "$STATUS" | grep ''nothing to commit, working tree clean''
+
+        '
