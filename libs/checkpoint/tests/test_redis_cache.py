@@ -9,6 +9,17 @@ import redis
 from langgraph.cache.base import FullKey
 from langgraph.cache.redis import RedisCache
 
+LITERAL_GLOB_CASES = [
+    pytest.param("team*", "teamB", id="asterisk"),
+    pytest.param("team?", "teamB", id="question-mark"),
+    pytest.param("team[ab]", "teama", id="character-class"),
+    pytest.param("team[^a]", "teamB", id="negated-character-class"),
+    pytest.param("team[a-c]", "teamb", id="character-range"),
+    pytest.param(r"team\B", "teamB", id="backslash"),
+    pytest.param("team\\", "team", id="trailing-backslash"),
+    pytest.param(r"team\*?[ab]", "team*Ba", id="combined"),
+]
+
 
 class TestRedisCache:
     @pytest.fixture(autouse=True)
@@ -146,6 +157,83 @@ class TestRedisCache:
         result = self.cache.get(keys)
         assert len(result) == 1
         assert result[keys[1]] == {"result": 2}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+    @pytest.mark.parametrize(
+        "namespace_prefix", [(), ("graph",)], ids=["single-segment", "later-segment"]
+    )
+    @pytest.mark.parametrize(
+        ("literal_segment", "unrelated_segment"), LITERAL_GLOB_CASES
+    )
+    async def test_clear_treats_namespace_as_literal(
+        self,
+        literal_segment: str,
+        unrelated_segment: str,
+        namespace_prefix: tuple[str, ...],
+        use_async: bool,
+    ) -> None:
+        namespace = (*namespace_prefix, literal_segment)
+        selected: list[FullKey] = [(namespace, "job1"), (namespace, "job2")]
+        unrelated: FullKey = ((*namespace_prefix, unrelated_segment), "job1")
+        keys = [*selected, unrelated]
+        expected = {
+            selected[0]: "selected one",
+            selected[1]: "selected two",
+            unrelated: "unrelated",
+        }
+        self.cache.set({key: (value, None) for key, value in expected.items()})
+        assert self.cache.get(keys) == expected
+
+        if use_async:
+            await self.cache.aclear([namespace])
+        else:
+            self.cache.clear([namespace])
+
+        assert self.cache.get(keys) == {unrelated: "unrelated"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+    @pytest.mark.parametrize("clear_all", [False, True], ids=["namespace", "all"])
+    @pytest.mark.parametrize(
+        ("literal_segment", "unrelated_segment"), LITERAL_GLOB_CASES
+    )
+    async def test_clear_treats_prefix_as_literal(
+        self,
+        literal_segment: str,
+        unrelated_segment: str,
+        clear_all: bool,
+        use_async: bool,
+    ) -> None:
+        cache: RedisCache = RedisCache(self.client, prefix=f"test:{literal_segment}:")
+        unrelated_cache: RedisCache = RedisCache(
+            self.client, prefix=f"test:{unrelated_segment}:"
+        )
+        selected: FullKey = (("graph", "node"), "job")
+        other_namespace: FullKey = (("other", "node"), "job")
+        keys = [selected, other_namespace]
+        expected = {selected: "selected", other_namespace: "other namespace"}
+        unrelated_expected = {
+            selected: "unrelated selected",
+            other_namespace: "unrelated other namespace",
+        }
+        cache.set({key: (value, None) for key, value in expected.items()})
+        unrelated_cache.set(
+            {key: (value, None) for key, value in unrelated_expected.items()}
+        )
+        assert cache.get(keys) == expected
+        assert unrelated_cache.get(keys) == unrelated_expected
+
+        namespaces = None if clear_all else [selected[0]]
+        if use_async:
+            await cache.aclear(namespaces)
+        else:
+            cache.clear(namespaces)
+
+        assert cache.get(keys) == (
+            {} if clear_all else {other_namespace: "other namespace"}
+        )
+        assert unrelated_cache.get(keys) == unrelated_expected
 
     def test_empty_operations(self) -> None:
         """Test behavior with empty keys/values."""

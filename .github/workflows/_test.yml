@@ -24,6 +24,16 @@ jobs:
           - "3.14"
 
     name: "test #${{ matrix.python-version }}"
+    services:
+      redis:
+        image: ${{ inputs.working-directory == 'libs/checkpoint' && 'redis:8.0.5-alpine' || '' }}
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Python ${{ matrix.python-version }}
@@ -43,6 +53,12 @@ jobs:
         shell: bash
         working-directory: ${{ inputs.working-directory }}
         run: uv sync --frozen --group test --no-dev
+
+      - name: Check Redis is available
+        if: ${{ inputs.working-directory == 'libs/checkpoint' }}
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+        run: uv run python -c "import redis; assert redis.Redis(host='localhost', port=6379, socket_connect_timeout=5, socket_timeout=5).ping()"
 
       - name: Run tests
         shell: bash
