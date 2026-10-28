@@ -1,4 +1,7 @@
+import json
 import os
+import pathlib
+import shutil
 import tarfile
 from unittest.mock import patch
 
@@ -11,7 +14,8 @@ from langgraph_cli.archive import (
     _tar_filter,
     create_archive,
 )
-from langgraph_cli.config import LocalDeps
+from langgraph_cli.config import LocalDeps, validate_config_file
+from langgraph_cli.uv_lock import _plan_uv_lock_workspace
 
 # ---------------------------------------------------------------------------
 # _tar_filter
@@ -186,6 +190,96 @@ class TestAddDirectory:
 
 
 class TestCreateArchive:
+    @pytest.mark.parametrize(
+        ("config_directory", "expected_config_path"),
+        [
+            ("workspace/apps/agent", "apps/agent/langgraph.json"),
+            ("workspace", "langgraph.json"),
+            (".", "langgraph.json"),
+            ("deployment", "deployment/langgraph.json"),
+        ],
+    )
+    def test_uv_workspace_survives_archive(
+        self, tmp_path, config_directory, expected_config_path
+    ):
+        example = pathlib.Path(__file__).parents[2] / "uv-examples" / "monorepo"
+        workspace = tmp_path / "workspace"
+        shutil.copytree(example, workspace)
+        # uv export also needs manifests for members outside the install closure.
+        unused = workspace / "libs" / "unused"
+        unused.mkdir()
+        (unused / "pyproject.toml").write_text(
+            '[project]\nname = "unused"\nversion = "0.1.0"\n'
+        )
+        config_dir = tmp_path / config_directory
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "langgraph.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "graphs": {
+                        "agent": os.path.relpath(
+                            workspace / "apps/agent/src/agent/graph.py", config_dir
+                        ).replace(os.sep, "/")
+                        + ":graph"
+                    },
+                    "source": {
+                        "kind": "uv",
+                        "root": os.path.relpath(workspace, config_dir),
+                        "package": "agent",
+                    },
+                }
+            )
+        )
+        # Ignore scopes must survive collapsing overlapping archive roots.
+        for directory in {workspace, config_dir}:
+            (directory / ".dockerignore").write_text("/private.txt\n")
+            (directory / "private.txt").write_text("excluded")
+            (directory / ".gitignore").write_text("/local-only/\n")
+            (directory / "local-only").mkdir()
+            (directory / "local-only" / "data.txt").write_text("excluded")
+        unrelated = tmp_path / "unrelated"
+        unrelated.mkdir()
+        (unrelated / "outside.txt").write_text("outside both contexts")
+        config = validate_config_file(config_path)
+        original = _plan_uv_lock_workspace(config_path, config)
+
+        with create_archive(config_path, config) as (archive_path, _, config_rel):
+            assert config_rel == expected_config_path
+            with tarfile.open(archive_path, "r:gz") as archive:
+                names = archive.getnames()
+                assert len(names) == len(set(names))
+                assert not any(name.endswith("private.txt") for name in names)
+                assert not any("local-only/" in name for name in names)
+                if config_directory != ".":
+                    assert not any(name.endswith("outside.txt") for name in names)
+                extracted = tmp_path / "extracted"
+                for member in archive.getmembers():
+                    contents = archive.extractfile(member)
+                    assert contents is not None
+                    destination = extracted / member.name
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(contents.read())
+
+        restored_config_path = extracted / config_rel
+        restored = _plan_uv_lock_workspace(
+            restored_config_path, validate_config_file(restored_config_path)
+        )
+        assert restored.uv_lock_path.read_bytes() == original.uv_lock_path.read_bytes()
+        assert (restored.project_root / "libs/unused/pyproject.toml").read_bytes() == (
+            unused / "pyproject.toml"
+        ).read_bytes()
+        assert [package.name for package in restored.install_order] == [
+            package.name for package in original.install_order
+        ]
+        for package in original.install_order:
+            relative_root = package.root.relative_to(original.project_root)
+            restored_root = restored.project_root / relative_root
+            for source in package.root.rglob("*.py"):
+                assert (
+                    restored_root / source.relative_to(package.root)
+                ).read_bytes() == (source.read_bytes())
+
     def _make_project(self, tmp_path):
         """Set up a minimal project directory with a config file."""
         project = tmp_path / "myproject"
