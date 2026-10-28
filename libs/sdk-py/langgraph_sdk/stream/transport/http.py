@@ -99,7 +99,8 @@ class ProtocolSseTransport:
         Posts `params` as a SubscribeParams body to `/threads/{thread_id}/stream/events`.
         Returns an `EventStreamHandle` whose `events` async iterator yields typed
         `Event` dicts as the server emits them. `handle.ready` resolves on a 2xx
-        response (rejects on HTTP error or transport failure before headers).
+        SSE response (rejects on HTTP error, invalid content type, or transport
+        failure before headers).
 
         Reconnect: pass `params["since"]` to filter outbound seqs server-side. The
         cursor goes in the request body, not as a `Last-Event-ID` header.
@@ -129,6 +130,14 @@ class ProtocolSseTransport:
                     headers=sse_headers,
                 ) as response:
                     response.raise_for_status()
+                    content_type = response.headers.get("content-type", "").partition(
+                        ";"
+                    )[0]
+                    if "text/event-stream" not in content_type:
+                        raise httpx.TransportError(
+                            "Expected response header Content-Type to contain "
+                            f"'text/event-stream', got {content_type!r}"
+                        )
                     if not ready.done():
                         ready.set_result(None)
                     line_decoder = BytesLineDecoder()

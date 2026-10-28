@@ -127,6 +127,65 @@ async def test_open_event_stream_yields_scripted_events():
     assert methods == ["lifecycle", "values"]
 
 
+@pytest.mark.parametrize(
+    "content_type",
+    [None, "text/html", "application/json", "text/plain; format=text/event-stream"],
+)
+async def test_open_event_stream_rejects_invalid_content_type(content_type: str | None):
+    class TrackingStream(httpx.AsyncByteStream):
+        read = False
+        closed = False
+
+        async def __aiter__(self):
+            self.read = True
+            yield b'data: {"method": "values"}\n\n'
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = TrackingStream()
+    headers = {"content-type": content_type} if content_type is not None else {}
+    response = httpx.Response(200, headers=headers, stream=stream)
+    transport = httpx.MockTransport(lambda _request: response)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        sse = ProtocolSseTransport(client=client, thread_id="t-1")
+        handle = sse.open_event_stream({"channels": ["values"]})
+        try:
+            with pytest.raises(httpx.TransportError, match="Content-Type") as exc_info:
+                await asyncio.wait_for(handle.ready, timeout=1.0)
+            assert await asyncio.wait_for(handle.done, timeout=1.0) is exc_info.value
+            assert [event async for event in handle.events] == []
+            assert stream.closed
+            assert not stream.read
+        finally:
+            await handle.close()
+            await sse.close()
+
+
+@pytest.mark.parametrize(
+    "content_type", ["text/event-stream", "text/event-stream; charset=utf-8"]
+)
+async def test_open_event_stream_accepts_sse_content_type(content_type: str):
+    event = values_event(seq=1)
+    response = httpx.Response(
+        200,
+        headers={"content-type": content_type},
+        content=b"data: " + orjson.dumps(event) + b"\n\n",
+    )
+    transport = httpx.MockTransport(lambda _request: response)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        sse = ProtocolSseTransport(client=client, thread_id="t-1")
+        handle = sse.open_event_stream({"channels": ["values"]})
+        try:
+            await asyncio.wait_for(handle.ready, timeout=1.0)
+            assert [received async for received in handle.events] == [event]
+            assert await asyncio.wait_for(handle.done, timeout=1.0) is None
+            assert response.is_closed
+        finally:
+            await handle.close()
+            await sse.close()
+
+
 async def test_open_event_stream_passes_since_in_body():
 
     fake = FakeServer()
@@ -221,7 +280,9 @@ async def test_mid_stream_error_after_ready_surfaces_on_done():
             yield b'event: message\ndata: {"jsonrpc": "2.0"}\n\n'
             raise RuntimeError("simulated mid-stream drop")
 
-        return httpx.Response(200, content=body())
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=body()
+        )
 
     mock = httpx.MockTransport(handler)
     async with httpx.AsyncClient(
@@ -248,7 +309,9 @@ async def test_clean_stream_end_done_resolves_with_none():
         async def body():
             yield b'event: message\ndata: {"jsonrpc": "2.0"}\n\n'
 
-        return httpx.Response(200, content=body())
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=body()
+        )
 
     mock = httpx.MockTransport(handler)
     async with httpx.AsyncClient(
@@ -301,7 +364,9 @@ async def test_cancel_event_prevents_post_cancel_flush():
             yield b'event: message\ndata: {"seq": 2}\n\n'
             yield b'event: message\ndata: {"seq": 3}\n\n'
 
-        return httpx.Response(200, content=body())
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=body()
+        )
 
     mock = httpx.MockTransport(handler)
     async with httpx.AsyncClient(
