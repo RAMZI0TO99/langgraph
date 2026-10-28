@@ -263,6 +263,52 @@ def test_sync_ws_handshake_forwards_httpx_client_cookies():
     assert "session=abc123" in headers_dict["Cookie"]
 
 
+@pytest.mark.parametrize("scheme", ["http", "https"])
+@pytest.mark.parametrize("base_path", ["/api", "/api/", "/api//", "/%61pi"])
+def test_sync_ws_handshake_scopes_cookies_to_prefixed_stream_url(
+    scheme: str, base_path: str
+):
+    captured: list[tuple[str, httpx.Headers]] = []
+    socket = _FakeSyncWebSocket([])
+
+    def connect(
+        url: str, additional_headers: list[tuple[str, str]] | None = None, **_kw: Any
+    ):
+        captured.append((url, httpx.Headers(additional_headers)))
+        return socket
+
+    with httpx.Client(base_url=f"{scheme}://example.com{base_path}") as client:
+        client.cookies.set("session", "abc123", domain="example.com", path="/api")
+        client.cookies.set(
+            "stream", "xyz", domain="example.com", path="/api/threads/t-1/stream/events"
+        )
+        client.cookies.set("unprefixed", "no", domain="example.com", path="/threads")
+        client.cookies.set("sibling", "no", domain="example.com", path="/apix")
+        client.cookies.set("other_domain", "no", domain="other.example", path="/api")
+        client.cookies.extract_cookies(
+            httpx.Response(
+                200,
+                headers={"set-cookie": "secure=yes; Path=/; Secure"},
+                request=httpx.Request("GET", f"{scheme}://example.com/api/login"),
+            )
+        )
+        transport = SyncProtocolWebSocketTransport(
+            client=client, thread_id="t-1", connect=connect
+        )
+        handle = transport.open_event_stream({"channels": ["values"]})
+        list(handle.events)
+        handle.close()
+
+    ws_scheme = "wss" if scheme == "https" else "ws"
+    assert len(captured) == 1
+    url, headers = captured[0]
+    assert url == f"{ws_scheme}://example.com/api/threads/t-1/stream/events"
+    expected = {"session=abc123", "stream=xyz"}
+    if scheme == "https":
+        expected.add("secure=yes")
+    assert set(headers["cookie"].split("; ")) == expected
+
+
 def test_sync_close_before_iteration_closes_socket():
     """Calling `handle.close()` before iterating events must close the socket."""
     connect_calls: list[str] = []
