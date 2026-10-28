@@ -147,7 +147,9 @@ def _cookie_header(client: httpx.Client, path: str) -> str | None:
     """
     if not list(client.cookies.jar):
         return None
-    target = client.base_url.copy_with(path=path)
+    target = httpx.URL(build_websocket_url(client.base_url, path)).copy_with(
+        scheme=client.base_url.scheme
+    )
     request = httpx.Request("GET", target)
     client.cookies.set_cookie_header(request)
     return request.headers.get("Cookie")
