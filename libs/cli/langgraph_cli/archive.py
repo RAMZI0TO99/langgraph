@@ -11,6 +11,7 @@ import pathspec
 
 from langgraph_cli._ignore import _build_ignore_spec
 from langgraph_cli.config import Config, _assemble_local_deps
+from langgraph_cli.uv_lock import _plan_uv_lock_workspace
 
 _WARN_SIZE = 50 * 1024 * 1024  # 50 MB
 _MAX_SIZE = 200 * 1024 * 1024  # 200 MB
@@ -30,25 +31,31 @@ def _add_directory(
     source_dir: pathlib.Path,
     arcname_prefix: str | None,
     ignore_spec: pathspec.PathSpec,
+    scoped_ignore_specs: dict[pathlib.Path, pathspec.PathSpec] | None = None,
 ) -> None:
     """Recursively add a directory to the tarball under the given prefix.
 
     If arcname_prefix is None, files are added at the archive root.
-    Paths matching ignore_spec are excluded.
+    Paths matching ignore_spec or an applicable scoped ignore spec are excluded.
     """
+    specs = {source_dir: ignore_spec, **(scoped_ignore_specs or {})}
+
+    def is_ignored(path: pathlib.Path, *, is_dir: bool = False) -> bool:
+        for scope, spec in specs.items():
+            if path.is_relative_to(scope):
+                relative = path.relative_to(scope).as_posix()
+                if spec.match_file(relative + ("/" if is_dir else "")):
+                    return True
+        return False
+
     for root, dirs, files in os.walk(source_dir):
-        rel_root = os.path.relpath(root, source_dir).replace(os.sep, "/")
         dirs[:] = [
-            d
-            for d in dirs
-            if not ignore_spec.match_file(
-                f"{rel_root}/{d}/" if rel_root != "." else f"{d}/"
-            )
+            d for d in dirs if not is_ignored(pathlib.Path(root) / d, is_dir=True)
         ]
         for f in files:
             full_path = os.path.join(root, f)
             rel = os.path.relpath(full_path, source_dir).replace(os.sep, "/")
-            if ignore_spec.match_file(rel):
+            if is_ignored(pathlib.Path(full_path)):
                 continue
             arcname = f"{arcname_prefix}/{rel}" if arcname_prefix else rel
             info = tar.gettarinfo(full_path, arcname=arcname)
@@ -66,7 +73,7 @@ def create_archive(
 ):
     """Context manager that creates a .tar.gz archive of the project source.
 
-    Uses _assemble_local_deps to discover local dependencies referenced in
+    Includes the configured uv workspace, or local dependencies referenced in
     langgraph.json, including those outside config.parent (monorepo case).
 
     The archive preserves the real filesystem layout relative to the common
@@ -80,10 +87,26 @@ def create_archive(
     config_path = config_path.resolve()
     context_dir = config_path.parent
 
-    local_deps = _assemble_local_deps(config_path, config)
-    extra_contexts = local_deps.additional_contexts or []
+    source = config.get("source")
+    scoped_ignore_specs = None
+    if source and source["kind"] == "uv":
+        project_root = _plan_uv_lock_workspace(config_path, config).project_root
+        extra_contexts = [project_root]
+        # Retain both contexts' exclusions even when one contains the other.
+        scoped_ignore_specs = {
+            path: _build_ignore_spec(path) for path in (context_dir, project_root)
+        }
+    else:
+        local_deps = _assemble_local_deps(config_path, config)
+        extra_contexts = local_deps.additional_contexts or []
 
     dirs_to_include = [context_dir] + list(extra_contexts)
+    if scoped_ignore_specs is not None:
+        dirs_to_include = [
+            path
+            for path in dict.fromkeys(dirs_to_include)
+            if not any(parent in path.parents for parent in dirs_to_include)
+        ]
 
     common = context_dir
     for d in extra_contexts:
@@ -104,7 +127,11 @@ def create_archive(
                 added_dirs.add(key)
                 ignore_spec = _build_ignore_spec(dir_path)
                 _add_directory(
-                    tar, dir_path, arcname_prefix=prefix, ignore_spec=ignore_spec
+                    tar,
+                    dir_path,
+                    arcname_prefix=prefix,
+                    ignore_spec=ignore_spec,
+                    scoped_ignore_specs=scoped_ignore_specs,
                 )
 
         file_size = os.path.getsize(archive_path)
