@@ -19,6 +19,7 @@ from typing import Literal, cast
 
 import ormsgpack
 import pytest
+from Crypto.Cipher import AES
 from pydantic import BaseModel
 
 from langgraph.checkpoint.base import BaseCheckpointSaver, _with_msgpack_allowlist
@@ -72,6 +73,53 @@ def _make_encrypted_serde(
     return EncryptedSerializer.from_pycryptodome_aes(
         serde=inner, key=b"1234567890123456"
     )
+
+
+@pytest.mark.parametrize("mode", [AES.MODE_EAX, AES.MODE_GCM], ids=["eax", "gcm"])
+@pytest.mark.parametrize("mac_len", [4, 8, 12, 16])
+def test_aes_configured_tag_length(mode: int, mac_len: int) -> None:
+    key = b"1234567890123456"
+    serde = EncryptedSerializer.from_pycryptodome_aes(
+        key=key, mode=mode, mac_len=mac_len
+    )
+    value = {"answer": 42}
+
+    encoded = serde.dumps_typed(value)
+    # A fresh serializer must also be able to resume a stored checkpoint.
+    restored = EncryptedSerializer.from_pycryptodome_aes(
+        key=key, mode=mode, mac_len=mac_len
+    )
+    assert restored.loads_typed(encoded) == value
+
+    # Both tag and ciphertext corruption must still fail authentication.
+    typ, ciphertext = encoded
+    for index in (16, len(ciphertext) - 1):
+        tampered = bytearray(ciphertext)
+        tampered[index] ^= 1
+        with pytest.raises(ValueError, match="MAC check failed"):
+            restored.loads_typed((typ, bytes(tampered)))
+
+
+def test_aes_default_tag_length_preserves_existing_payloads() -> None:
+    key = b"1234567890123456"
+    nonce = b"abcdefghijklmnop"
+    value = {"answer": 42}
+    typ, plaintext = JsonPlusSerializer().dumps_typed(value)
+    cipher = AES.new(key, AES.MODE_EAX, nonce=nonce)
+    ciphertext, tag = cipher.encrypt_and_digest(plaintext)
+
+    serde = EncryptedSerializer.from_pycryptodome_aes(key=key)
+    assert serde.loads_typed((f"{typ}+aes", nonce + tag + ciphertext)) == value
+
+
+@pytest.mark.parametrize("mode", [AES.MODE_EAX, AES.MODE_GCM], ids=["eax", "gcm"])
+@pytest.mark.parametrize("mac_len", [0, 17])
+def test_aes_invalid_tag_length(mode: int, mac_len: int) -> None:
+    serde = EncryptedSerializer.from_pycryptodome_aes(
+        key=b"1234567890123456", mode=mode, mac_len=mac_len
+    )
+    with pytest.raises(ValueError, match="mac_len"):
+        serde.dumps_typed({"answer": 42})
 
 
 def test_msgpack_method_pathlib_blocked_encrypted_strict(

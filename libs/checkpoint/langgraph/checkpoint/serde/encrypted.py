@@ -71,8 +71,9 @@ class EncryptedSerializer(SerializerProtocol):
             def decrypt(self, ciphername: str, ciphertext: bytes) -> bytes:
                 assert ciphername == "aes", f"Unsupported cipher: {ciphername}"
                 nonce = ciphertext[:16]
-                tag = ciphertext[16:32]
-                actual_ciphertext = ciphertext[32:]
+                tag_end = 16 + kwargs.get("mac_len", 16)
+                tag = ciphertext[16:tag_end]
+                actual_ciphertext = ciphertext[tag_end:]
 
                 cipher = AES.new(key, **kwargs, nonce=nonce)
                 return cipher.decrypt_and_verify(actual_ciphertext, tag)
