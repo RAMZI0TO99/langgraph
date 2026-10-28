@@ -73,9 +73,13 @@ class SyncProtocolWebSocketTransport:
         stream_error: BaseException | None = None
 
         url = build_websocket_url(self._client.base_url, self._stream_path)
-        handshake_headers = list(websocket_headers(self._default_headers))
+        handshake_headers = websocket_headers(
+            self._client.headers, self._default_headers
+        )
         cookie_header = _cookie_header(self._client, self._stream_path)
-        if cookie_header:
+        if cookie_header and not any(
+            key.lower() == "cookie" for key, _ in handshake_headers
+        ):
             handshake_headers.append(("Cookie", cookie_header))
         # Pre-enter the WebSocket context manager so close() can reach the socket
         # immediately, even before the caller has started iterating events().
