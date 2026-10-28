@@ -1,6 +1,9 @@
 """Unit tests for Redis cache implementation."""
 
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
+from uuid import uuid4
 
 import pytest
 import redis
@@ -9,29 +12,29 @@ from langgraph.cache.base import FullKey
 from langgraph.cache.redis import RedisCache
 
 
+@contextmanager
+def _isolated_cache(client: redis.Redis) -> Iterator[RedisCache]:
+    cache: RedisCache = RedisCache(client, prefix=f"test:cache:{uuid4().hex}:")
+    try:
+        yield cache
+    finally:
+        cache.clear()
+
+
 class TestRedisCache:
     @pytest.fixture(autouse=True)
-    def setup(self) -> None:
+    def setup(self) -> Iterator[None]:
         """Set up test Redis client and cache."""
-        self.client = redis.Redis(
+        with redis.Redis(
             host="localhost", port=6379, db=0, decode_responses=False
-        )
-        try:
-            self.client.ping()
-        except redis.ConnectionError:
-            pytest.skip("Redis server not available")
+        ) as self.client:
+            try:
+                self.client.ping()
+            except redis.ConnectionError:
+                pytest.skip("Redis server not available")
 
-        self.cache: RedisCache = RedisCache(self.client, prefix="test:cache:")
-
-        # Clean up before each test
-        self.client.flushdb()
-
-    def teardown_method(self) -> None:
-        """Clean up after each test."""
-        try:
-            self.client.flushdb()
-        except Exception:
-            pass
+            with _isolated_cache(self.client) as self.cache:
+                yield
 
     def test_basic_set_and_get(self) -> None:
         """Test basic set and get operations."""
@@ -164,59 +167,64 @@ class TestRedisCache:
     @pytest.mark.asyncio
     async def test_async_operations(self) -> None:
         """Test async set and get operations with sync Redis client."""
-        # Create sync Redis client and cache (like main integration tests)
-        client = redis.Redis(host="localhost", port=6379, db=1, decode_responses=False)
-        try:
-            client.ping()
-        except Exception:
-            pytest.skip("Redis not available")
-
-        cache: RedisCache = RedisCache(client, prefix="test:async:")
-
         keys: list[FullKey] = [(("graph", "node"), "async_key")]
         values = {keys[0]: ({"async": True}, None)}
 
         # Async set (delegates to sync)
-        await cache.aset(values)
+        await self.cache.aset(values)
 
         # Async get (delegates to sync)
-        result = await cache.aget(keys)
+        result = await self.cache.aget(keys)
         assert len(result) == 1
         assert result[keys[0]] == {"async": True}
-
-        # Cleanup
-        client.flushdb()
 
     @pytest.mark.asyncio
     async def test_async_clear(self) -> None:
         """Test async clear operations with sync Redis client."""
-        # Create sync Redis client and cache (like main integration tests)
-        client = redis.Redis(host="localhost", port=6379, db=1, decode_responses=False)
-        try:
-            client.ping()
-        except Exception:
-            pytest.skip("Redis not available")
-
-        cache: RedisCache = RedisCache(client, prefix="test:async:")
-
         keys: list[FullKey] = [(("graph", "node"), "key")]
         values = {keys[0]: ({"data": "test"}, None)}
 
-        await cache.aset(values)
+        await self.cache.aset(values)
 
         # Verify data exists
-        result = await cache.aget(keys)
+        result = await self.cache.aget(keys)
         assert len(result) == 1
 
         # Clear all (delegates to sync)
-        await cache.aclear()
+        await self.cache.aclear()
 
         # Verify data is gone
-        result = await cache.aget(keys)
+        result = await self.cache.aget(keys)
         assert len(result) == 0
 
-        # Cleanup
-        client.flushdb()
+    @pytest.mark.parametrize("fail", [False, True])
+    @pytest.mark.parametrize("use_async", [False, True])
+    @pytest.mark.asyncio
+    async def test_cleanup_preserves_other_caches(
+        self, fail: bool, use_async: bool
+    ) -> None:
+        key: FullKey = (("graph", "node"), "shared_key")
+        self.cache.set({key: ("other cache", None)})
+
+        expected_error = (
+            pytest.raises(RuntimeError, match="simulated test failure")
+            if fail
+            else nullcontext()
+        )
+        with expected_error:
+            with _isolated_cache(self.client) as cache:
+                values = {key: ("temporary cache", None)}
+                if use_async:
+                    await cache.aset(values)
+                    assert await cache.aget([key]) == {key: "temporary cache"}
+                else:
+                    cache.set(values)
+                    assert cache.get([key]) == {key: "temporary cache"}
+                if fail:
+                    raise RuntimeError("simulated test failure")
+
+        assert cache.get([key]) == {}
+        assert self.cache.get([key]) == {key: "other cache"}
 
     def test_redis_unavailable_get(self) -> None:
         """Test behavior when Redis is unavailable during get operations."""
