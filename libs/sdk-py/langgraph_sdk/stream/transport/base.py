@@ -75,5 +75,28 @@ def build_websocket_url(base_url: httpx.URL, path: str) -> str:
     return str(base_url.copy_with(scheme=scheme, path=full_path, query=None))
 
 
-def websocket_headers(headers: Mapping[str, str] | None) -> list[tuple[str, str]]:
-    return list(dict(headers or {}).items())
+def websocket_headers(
+    client_headers: Mapping[str, str], headers: Mapping[str, str] | None
+) -> list[tuple[str, str]]:
+    """Inherit HTTP client headers, with explicit stream headers taking precedence."""
+    # The WebSocket library constructs the upgrade request and its framing.
+    # HTTP defaults such as Connection: keep-alive must not override that request.
+    excluded = {
+        "host",
+        "connection",
+        "upgrade",
+        "content-length",
+        "content-type",
+        "transfer-encoding",
+    }
+    merged = httpx.Headers(
+        {
+            key: value
+            for key, value in client_headers.items()
+            if key.lower() not in excluded
+            and not key.lower().startswith("sec-websocket-")
+        }
+    )
+    # Preserve explicit stream overrides, matching httpx's case-insensitive merge.
+    merged.update(headers or {})
+    return merged.multi_items()

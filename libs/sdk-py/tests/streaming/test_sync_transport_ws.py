@@ -236,7 +236,8 @@ def test_sync_ws_transport_forwards_ping_kwargs():
     assert captured_kwargs[0].get("ping_timeout") == 20.0
 
 
-def test_sync_ws_handshake_forwards_httpx_client_cookies():
+@pytest.mark.parametrize("cookie_header", [None, "client", "stream"])
+def test_sync_ws_handshake_forwards_httpx_client_cookies(cookie_header: str | None):
     """Cookies on the httpx.Client are forwarded to the WS handshake."""
     captured_headers: list[list[tuple[str, str]]] = []
     socket = _FakeSyncWebSocket([values_event(seq=1)])
@@ -250,17 +251,106 @@ def test_sync_ws_handshake_forwards_httpx_client_cookies():
 
     with httpx.Client(base_url="http://test") as client:
         client.cookies.set("session", "abc123")
+        if cookie_header is not None:
+            client.headers["cOoKiE"] = "session=client"
         transport = SyncProtocolWebSocketTransport(
-            client=client, thread_id="t-1", connect=connect
+            client=client,
+            thread_id="t-1",
+            headers={"COOKIE": "session=stream"} if cookie_header == "stream" else None,
+            connect=connect,
         )
         handle = transport.open_event_stream({"channels": ["values"]})
         list(handle.events)
         handle.close()
 
     assert len(captured_headers) == 1
-    headers_dict = dict(captured_headers[0])
-    assert "Cookie" in headers_dict
-    assert "session=abc123" in headers_dict["Cookie"]
+    cookies = httpx.Headers(captured_headers[0]).get_list("cookie")
+    assert cookies == [f"session={cookie_header or 'abc123'}"]
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_sync_ws_handshake_forwards_current_client_headers(override: bool):
+    captured: list[httpx.Headers] = []
+
+    def connect(url: str, additional_headers=None, **_kw: Any):
+        _ = url
+        captured.append(httpx.Headers(additional_headers))
+        return _FakeSyncWebSocket([])
+
+    with httpx.Client(
+        base_url="http://test",
+        headers={
+            "x-api-key": "initial-key",
+            "Authorization": "Bearer client-token",
+            "X-Tenant": "client-tenant",
+        },
+    ) as client:
+        transport = SyncProtocolWebSocketTransport(
+            client=client,
+            thread_id="t-1",
+            headers=(
+                {"authorization": "Bearer stream-token", "X-TENANT": "stream-tenant"}
+                if override
+                else None
+            ),
+            connect=connect,
+        )
+        for api_key in ("first-key", "refreshed-key"):
+            client.headers["X-Api-Key"] = api_key
+            handle = transport.open_event_stream({"channels": ["values"]})
+            list(handle.events)
+            handle.close()
+
+    assert [headers.get_list("x-api-key") for headers in captured] == [
+        ["first-key"],
+        ["refreshed-key"],
+    ]
+    for headers in captured:
+        assert headers.get_list("authorization") == [
+            "Bearer stream-token" if override else "Bearer client-token"
+        ]
+        assert headers.get_list("x-tenant") == [
+            "stream-tenant" if override else "client-tenant"
+        ]
+
+
+def test_sync_ws_handshake_does_not_inherit_http_protocol_headers():
+    captured: list[httpx.Headers] = []
+    protocol_headers = {
+        "Host": "http-host",
+        "Connection": "keep-alive",
+        "Upgrade": "h2c",
+        "Content-Length": "123",
+        "Content-Type": "application/json",
+        "Transfer-Encoding": "chunked",
+        "Sec-WebSocket-Key": "stale-key",
+        "Sec-WebSocket-Version": "12",
+        "Sec-WebSocket-Extensions": "stale-extension",
+        "Sec-WebSocket-Protocol": "stale-protocol",
+    }
+
+    def connect(url: str, additional_headers=None, **_kw: Any):
+        _ = url
+        captured.append(httpx.Headers(additional_headers))
+        return _FakeSyncWebSocket([])
+
+    with httpx.Client(
+        base_url="http://test", headers={**protocol_headers, "X-Api-Key": "client-key"}
+    ) as client:
+        transport = SyncProtocolWebSocketTransport(
+            client=client,
+            thread_id="t-1",
+            headers={"Origin": "https://app.example"},
+            connect=connect,
+        )
+        handle = transport.open_event_stream({"channels": ["values"]})
+        list(handle.events)
+        handle.close()
+
+    assert len(captured) == 1
+    assert captured[0]["x-api-key"] == "client-key"
+    assert captured[0]["origin"] == "https://app.example"
+    assert all(header not in captured[0] for header in protocol_headers)
 
 
 def test_sync_close_before_iteration_closes_socket():
